@@ -23,6 +23,7 @@
 
           nativeBuildInputs = with pkgs; [
             pkg-config
+            makeWrapper
           ];
 
           buildInputs = with pkgs; [

@@ -25,6 +25,56 @@ A Rust-based gamescope session launcher with automatic display detection and cap
 
 ## Installation
 
+### Using Nix Flakes (Recommended)
+
+This project provides a Nix flake with home-manager and NixOS modules.
+
+1. Add to your `flake.nix` inputs:
+
+```nix
+{
+  inputs = {
+    console-mode = {
+      url = "github:yourusername/console-mode";
+      # Or use local path during development:
+      # url = "path:/home/betongsuggan/development/console-mode";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+}
+```
+
+2. Import the home-manager module:
+
+```nix
+{
+  outputs = { nixpkgs, home-manager, console-mode, ... }: {
+    homeConfigurations.yourusername = home-manager.lib.homeManagerConfiguration {
+      modules = [
+        console-mode.homeManagerModules.default
+        ./home.nix
+      ];
+    };
+  };
+}
+```
+
+3. Configure in your `home.nix`:
+
+```nix
+{
+  programs.console-mode = {
+    enable = true;
+    autoStart = true;  # Auto-start on TTY1
+    resolution = "2560x1440";
+    refreshRate = 144;
+    forceVrr = true;
+  };
+}
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md) for detailed configuration options.
+
 ### From Source
 
 ```bash
@@ -35,20 +85,13 @@ cargo build --release
 
 The binary will be located at `target/release/console-mode`.
 
-### Using Nix
+### Using Nix (without flakes)
 
-Add to your NixOS configuration or home-manager:
+Build and run directly:
 
-```nix
-# In your packages list
-(pkgs.rustPlatform.buildRustPackage {
-  pname = "console-mode";
-  version = "0.1.0";
-  src = /path/to/console-mode;
-  cargoLock = {
-    lockFile = /path/to/console-mode/Cargo.lock;
-  };
-})
+```bash
+nix build
+./result/bin/console-mode --help
 ```
 
 ## Usage
