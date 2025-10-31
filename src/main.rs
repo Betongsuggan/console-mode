@@ -467,9 +467,11 @@ fn launch_gamescope(display: &DisplayInfo, caps: &DisplayCapabilities, args: &Ar
         println!("\nRetrying with safe options...");
         thread::sleep(Duration::from_secs(2));
 
+        let width_str = display.width.to_string();
+        let height_str = display.height.to_string();
         let safe_args = vec![
-            "-W", &display.width.to_string(),
-            "-H", &display.height.to_string(),
+            "-W", width_str.as_str(),
+            "-H", height_str.as_str(),
             "-r", "120",
             "-f", "-e",
         ];
