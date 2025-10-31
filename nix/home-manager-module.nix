@@ -8,20 +8,26 @@ let
   console-mode-pkg = pkgs.callPackage ./package.nix { };
 
   # Build the command line arguments based on configuration
-  mkArgs = cfg: lib.concatStringsSep " " (
-    lib.optionals (cfg.display != null) [ "--display" cfg.display ] ++
-    lib.optionals (cfg.resolution != null) [ "--resolution" cfg.resolution ] ++
-    lib.optionals (cfg.refreshRate != null) [ "--refresh-rate" (toString cfg.refreshRate) ] ++
-    lib.optionals cfg.forceVrr [ "--force-vrr" ] ++
-    lib.optionals cfg.forceHdr [ "--force-hdr" ] ++
-    lib.optionals cfg.noVrr [ "--no-vrr" ] ++
-    lib.optionals cfg.noHdr [ "--no-hdr" ] ++
-    lib.optionals cfg.safeMode [ "--safe-mode" ] ++
-    lib.optionals (cfg.gamescopeBin != null) [ "--gamescope-bin" cfg.gamescopeBin ] ++
-    lib.optionals (cfg.steamBin != null) [ "--steam-bin" cfg.steamBin ] ++
-    lib.optionals (cfg.steamArgs != []) ([ "--steam-args" ] ++ cfg.steamArgs) ++
-    cfg.extraArgs
-  );
+  mkArgs = cfg:
+    lib.concatStringsSep " "
+    (lib.optionals (cfg.display != null) [ "--display" cfg.display ]
+      ++ lib.optionals (cfg.resolution != null) [
+        "--resolution"
+        cfg.resolution
+      ] ++ lib.optionals (cfg.refreshRate != null) [
+        "--refresh-rate"
+        (toString cfg.refreshRate)
+      ] ++ lib.optionals cfg.forceVrr [ "--force-vrr" ]
+      ++ lib.optionals cfg.forceHdr [ "--force-hdr" ]
+      ++ lib.optionals cfg.noVrr [ "--no-vrr" ]
+      ++ lib.optionals cfg.noHdr [ "--no-hdr" ]
+      ++ lib.optionals cfg.safeMode [ "--safe-mode" ]
+      ++ lib.optionals (cfg.gamescopeBin != null) [
+        "--gamescope-bin"
+        cfg.gamescopeBin
+      ] ++ lib.optionals (cfg.steamBin != null) [ "--steam-bin" cfg.steamBin ]
+      ++ lib.optionals (cfg.steamArgs != [ ])
+      ([ "--steam-args" ] ++ cfg.steamArgs) ++ cfg.extraArgs);
 
   consoleModeCommand = pkgs.writeShellScript "console-mode-wrapped" ''
     exec ${console-mode-pkg}/bin/console-mode ${mkArgs cfg}
@@ -146,7 +152,7 @@ in {
 
     steamArgs = mkOption {
       type = types.listOf types.str;
-      default = [];
+      default = [ ];
       example = [ "-steamos3" ];
       description = ''
         Additional arguments to pass to Steam. Use ["-steamos3"] to enable
@@ -156,7 +162,7 @@ in {
 
     extraArgs = mkOption {
       type = types.listOf types.str;
-      default = [];
+      default = [ ];
       example = [ "--prefer-vk-device" "1002:73ff" ];
       description = ''
         Additional arguments to pass to console-mode (and eventually gamescope).
@@ -165,7 +171,7 @@ in {
 
     environmentVariables = mkOption {
       type = types.attrsOf types.str;
-      default = {};
+      default = { };
       example = {
         RADV_PERFTEST = "gpl";
         MESA_VK_WSI_PRESENT_MODE = "mailbox";
@@ -222,30 +228,82 @@ in {
     # Set up auto-start on TTY if requested
     programs.bash.profileExtra = mkIf cfg.autoStart ''
       # Auto-start Console Mode on TTY${toString cfg.autoStartVT}
-      if [[ -z "$DISPLAY" && "$XDG_VTNR" = "${toString cfg.autoStartVT}" ]]; then
-        ${optionalString (cfg.environmentVariables != {}) ''
-          ${concatStringsSep "\n" (mapAttrsToList (name: value: "export ${name}=\"${value}\"") cfg.environmentVariables)}
-        ''}
+      # Ensure XDG_VTNR is set
+      if [[ -z "$XDG_VTNR" ]]; then
+        TTY=$(tty)
+        case "$TTY" in
+          /dev/tty[0-9]*)
+            export XDG_VTNR="''${TTY##*/tty}"
+            ;;
+        esac
+      fi
+
+      if [[ -z "$DISPLAY" && "$XDG_VTNR" = "${
+        toString cfg.autoStartVT
+      }" ]]; then
+        ${
+          optionalString (cfg.environmentVariables != { }) ''
+            ${concatStringsSep "\n"
+            (mapAttrsToList (name: value: ''export ${name}="${value}"'')
+              cfg.environmentVariables)}
+          ''
+        }
+        # Brief delay to allow DRM subsystem initialization
+        sleep 2
         exec ${consoleModeCommand}
       fi
     '';
 
     programs.zsh.profileExtra = mkIf cfg.autoStart ''
       # Auto-start Console Mode on TTY${toString cfg.autoStartVT}
-      if [[ -z "$DISPLAY" && "$XDG_VTNR" = "${toString cfg.autoStartVT}" ]]; then
-        ${optionalString (cfg.environmentVariables != {}) ''
-          ${concatStringsSep "\n" (mapAttrsToList (name: value: "export ${name}=\"${value}\"") cfg.environmentVariables)}
-        ''}
+      # Ensure XDG_VTNR is set
+      if [[ -z "$XDG_VTNR" ]]; then
+        TTY=$(tty)
+        case "$TTY" in
+          /dev/tty[0-9]*)
+            export XDG_VTNR="''${TTY##*/tty}"
+            ;;
+        esac
+      fi
+
+      if [[ -z "$DISPLAY" && "$XDG_VTNR" = "${
+        toString cfg.autoStartVT
+      }" ]]; then
+        ${
+          optionalString (cfg.environmentVariables != { }) ''
+            ${concatStringsSep "\n"
+            (mapAttrsToList (name: value: ''export ${name}="${value}"'')
+              cfg.environmentVariables)}
+          ''
+        }
+        # Brief delay to allow DRM subsystem initialization
+        sleep 2
         exec ${consoleModeCommand}
       fi
     '';
 
     programs.fish.loginShellInit = mkIf cfg.autoStart ''
       # Auto-start Console Mode on TTY${toString cfg.autoStartVT}
-      if test -z "$DISPLAY"; and test "$XDG_VTNR" = "${toString cfg.autoStartVT}"
-        ${optionalString (cfg.environmentVariables != {}) ''
-          ${concatStringsSep "\n" (mapAttrsToList (name: value: "set -x ${name} \"${value}\"") cfg.environmentVariables)}
-        ''}
+      # Ensure XDG_VTNR is set
+      if test -z "$XDG_VTNR"
+        set TTY (tty)
+        if string match -q '/dev/tty[0-9]*' $TTY
+          set -x XDG_VTNR (string replace '/dev/tty' ' ' $TTY | string trim)
+        end
+      end
+
+      if test -z "$DISPLAY"; and test "$XDG_VTNR" = "${
+        toString cfg.autoStartVT
+      }"
+        ${
+          optionalString (cfg.environmentVariables != { }) ''
+            ${concatStringsSep "\n"
+            (mapAttrsToList (name: value: ''set -x ${name} "${value}"'')
+              cfg.environmentVariables)}
+          ''
+        }
+        # Brief delay to allow DRM subsystem initialization
+        sleep 2
         exec ${consoleModeCommand}
       end
     '';
