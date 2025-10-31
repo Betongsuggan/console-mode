@@ -27,7 +27,8 @@ let
         cfg.gamescopeBin
       ] ++ lib.optionals (cfg.steamBin != null) [ "--steam-bin" cfg.steamBin ]
       ++ lib.optionals (cfg.steamArgs != [ ])
-      ([ "--steam-args" ] ++ cfg.steamArgs) ++ cfg.extraArgs);
+      [ "--steam-args='${lib.concatStringsSep " " cfg.steamArgs}'" ]
+      ++ cfg.extraArgs);
 
   consoleModeCommand = pkgs.writeShellScript "console-mode-wrapped" ''
     exec ${console-mode-pkg}/bin/console-mode ${mkArgs cfg}
