@@ -52,6 +52,10 @@ struct Args {
     #[arg(long)]
     steam_bin: Option<PathBuf>,
 
+    /// Additional steam arguments
+    #[arg(long, value_delimiter = ' ', num_args = 1..)]
+    steam_args: Vec<String>,
+
     /// Additional gamescope arguments
     #[arg(last = true)]
     extra_args: Vec<String>,
@@ -455,7 +459,8 @@ fn launch_gamescope(display: &DisplayInfo, caps: &DisplayCapabilities, args: &Ar
     cmd.args(&gs_args)
         .arg("--")
         .arg(steam_bin)
-        .arg("-bigpicture");
+        .arg("-bigpicture")
+        .args(&args.steam_args);
 
     let status = cmd.status()
         .context("Failed to launch gamescope")?;
@@ -488,7 +493,8 @@ fn launch_gamescope(display: &DisplayInfo, caps: &DisplayCapabilities, args: &Ar
         safe_cmd.args(safe_args)
             .arg("--")
             .arg(steam_bin)
-            .arg("-bigpicture");
+            .arg("-bigpicture")
+            .args(&args.steam_args);
 
         safe_cmd.status()
             .context("Failed to launch gamescope in safe mode")?;
@@ -506,7 +512,8 @@ fn launch_gamescope_fallback(args: &Args) -> Result<()> {
     let mut cmd = Command::new(gamescope_bin);
     cmd.args(["-W", "1920", "-H", "1080", "-r", "60", "-f", "-e", "--"])
         .arg(steam_bin)
-        .arg("-bigpicture");
+        .arg("-bigpicture")
+        .args(&args.steam_args);
 
     cmd.status()
         .context("Failed to launch gamescope in fallback mode")?;

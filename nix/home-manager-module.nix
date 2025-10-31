@@ -19,6 +19,7 @@ let
     lib.optionals cfg.safeMode [ "--safe-mode" ] ++
     lib.optionals (cfg.gamescopeBin != null) [ "--gamescope-bin" cfg.gamescopeBin ] ++
     lib.optionals (cfg.steamBin != null) [ "--steam-bin" cfg.steamBin ] ++
+    lib.optionals (cfg.steamArgs != []) ([ "--steam-args" ] ++ cfg.steamArgs) ++
     cfg.extraArgs
   );
 
@@ -140,6 +141,16 @@ in {
       example = "\${pkgs.steam}/bin/steam";
       description = ''
         Custom path to steam binary. If null, uses steam from PATH.
+      '';
+    };
+
+    steamArgs = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      example = [ "-steamos3" ];
+      description = ''
+        Additional arguments to pass to Steam. Use ["-steamos3"] to enable
+        Steam Deck features like Bluetooth device management in Big Picture mode.
       '';
     };
 
