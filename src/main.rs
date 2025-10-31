@@ -411,6 +411,14 @@ fn build_gamescope_args(display: &DisplayInfo, caps: &DisplayCapabilities, args:
         "-r".to_string(), caps.max_refresh_rate.to_string(),
     ];
 
+    // Specify which output to use (strip "cardX-" prefix if present)
+    let output_name = if let Some(stripped) = display.connector_name.split_once('-') {
+        stripped.1.to_string()
+    } else {
+        display.connector_name.clone()
+    };
+    gs_args.extend(["--prefer-output".to_string(), output_name]);
+
     if caps.vrr {
         gs_args.push("--adaptive-sync".to_string());
     }
