@@ -88,6 +88,21 @@ fn main() -> Result<()> {
     // Set up environment variables
     setup_environment()?;
 
+    // Check if we're running nested inside another compositor
+    let is_nested = is_running_nested();
+
+    if is_nested {
+        println!("Detected nested environment (running inside another compositor)");
+        println!("Launching in nested Wayland mode...");
+        println!("\nNote: You may see some warnings from gamescope/Mesa:");
+        println!("  - 'No CAP_SYS_NICE' - normal, doesn't affect gaming performance");
+        println!("  - 'libdecor warnings' - expected in nested mode");
+        println!("  - 'RADV not conformant' - safe to ignore, RADV works great for gaming");
+        println!("  - 'vk_khr_present_wait overridden' - informational only\n");
+        thread::sleep(Duration::from_secs(2));
+        return launch_gamescope_nested(&args);
+    }
+
     // Detect connected displays
     let displays = detect_displays()?;
 
@@ -586,6 +601,65 @@ fn launch_gamescope_fallback(args: &Args) -> Result<()> {
 
     cmd.status()
         .context("Failed to launch gamescope in fallback mode")?;
+
+    Ok(())
+}
+
+fn is_running_nested() -> bool {
+    // Check if we're running inside another compositor
+    // WAYLAND_DISPLAY indicates we're in a Wayland session
+    // DISPLAY indicates we're in an X11 session
+    std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
+}
+
+fn launch_gamescope_nested(args: &Args) -> Result<()> {
+    let gamescope_bin = args.gamescope_bin.as_deref()
+        .unwrap_or(Path::new("gamescope"));
+    let steam_bin = args.steam_bin.as_deref()
+        .unwrap_or(Path::new("steam"));
+
+    // Determine resolution from args or use defaults
+    let (width, height) = if let Some(ref res) = args.resolution {
+        parse_resolution(res)?
+    } else {
+        (1920, 1080)
+    };
+
+    let refresh_rate = args.refresh_rate.unwrap_or(60);
+
+    let mut gs_args = vec![
+        "-W".to_string(), width.to_string(),
+        "-H".to_string(), height.to_string(),
+        "-r".to_string(), refresh_rate.to_string(),
+        "--nested-width".to_string(), width.to_string(),
+        "--nested-height".to_string(), height.to_string(),
+        "--nested-refresh".to_string(), refresh_rate.to_string(),
+        "-e".to_string(),  // Expose Wayland socket
+    ];
+
+    // Add MangoHud if desired
+    gs_args.push("--mangoapp".to_string());
+
+    // Add any extra user-provided args
+    gs_args.extend(args.extra_args.clone());
+
+    println!("Launching gamescope in nested mode with: {}", gs_args.join(" "));
+    println!();
+    thread::sleep(Duration::from_secs(1));
+
+    let mut cmd = Command::new(gamescope_bin);
+    cmd.args(&gs_args)
+        .arg("--")
+        .arg(steam_bin)
+        .arg("-bigpicture")
+        .args(&args.steam_args);
+
+    let status = cmd.status()
+        .context("Failed to launch gamescope in nested mode")?;
+
+    if !status.success() {
+        anyhow::bail!("Gamescope exited with non-zero status");
+    }
 
     Ok(())
 }
