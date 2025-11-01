@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, value_delimiter = ' ', num_args = 1..)]
     steam_args: Vec<String>,
 
+    /// Launcher command for display selection (e.g., "dmenu", "rofi -dmenu", "wofi --dmenu")
+    #[arg(long)]
+    launcher: Option<String>,
+
     /// Additional gamescope arguments
     #[arg(last = true)]
     extra_args: Vec<String>,
@@ -101,7 +105,11 @@ fn main() -> Result<()> {
             .context(format!("Display '{}' not found", display_name))?
             .clone()
     } else if displays.len() > 1 {
-        select_display_interactive(&displays)?
+        if let Some(ref launcher_cmd) = args.launcher {
+            select_display_launcher(&displays, launcher_cmd)?
+        } else {
+            select_display_interactive(&displays)?
+        }
     } else {
         println!("Detected display: {} at {}", displays[0].connector_name, displays[0].resolution);
         thread::sleep(Duration::from_secs(1));
@@ -235,6 +243,67 @@ fn select_display_interactive(displays: &[DisplayInfo]) -> Result<DisplayInfo> {
         thread::sleep(Duration::from_secs(2));
         Ok(selected.clone())
     }
+}
+
+fn select_display_launcher(displays: &[DisplayInfo], launcher_cmd: &str) -> Result<DisplayInfo> {
+    // Create list of display options
+    let options: Vec<String> = displays
+        .iter()
+        .map(|d| format!("{} - {}", d.connector_name, d.resolution))
+        .collect();
+    let options_text = options.join("\n");
+
+    // Parse launcher command into program and arguments
+    let parts: Vec<&str> = launcher_cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        anyhow::bail!("Launcher command is empty");
+    }
+
+    let (program, args) = (parts[0], &parts[1..]);
+
+    // Spawn the launcher process with piped stdin/stdout
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context(format!("Failed to spawn launcher: {}", launcher_cmd))?;
+
+    // Write options to launcher's stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(options_text.as_bytes())
+            .context("Failed to write to launcher stdin")?;
+    }
+
+    // Read selection from launcher's stdout
+    let output = child.wait_with_output()
+        .context("Failed to wait for launcher")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Launcher exited with non-zero status (user may have cancelled)");
+    }
+
+    let selection = String::from_utf8(output.stdout)
+        .context("Launcher output is not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    if selection.is_empty() {
+        anyhow::bail!("No display selected");
+    }
+
+    // Find the matching display by parsing the selection
+    // Format is "connector_name - resolution"
+    let connector_name = selection
+        .split(" - ")
+        .next()
+        .context("Invalid selection format")?;
+
+    displays
+        .iter()
+        .find(|d| d.connector_name == connector_name)
+        .cloned()
+        .context(format!("Selected display '{}' not found", connector_name))
 }
 
 fn detect_capabilities(display: &DisplayInfo, args: &Args) -> Result<DisplayCapabilities> {
