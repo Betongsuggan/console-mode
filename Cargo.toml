@@ -13,6 +13,12 @@ thiserror = "1.0"
 regex = "1.10"
 libc = "0.2"
 
+# TUI launcher dependencies
+ratatui = "0.29"
+crossterm = "0.28"
+evdev = "0.12"
+chrono = "0.4"
+
 [profile.release]
 lto = true
 codegen-units = 1

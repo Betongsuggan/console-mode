@@ -1,12 +1,38 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
+use evdev::{Device, InputEventKind, Key};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame, Terminal,
+};
 use regex::Regex;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+/// Log debug messages to a file (since TUI takes over the terminal)
+fn debug_log(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/console-mode-debug.log")
+    {
+        let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+    }
+}
 
 /// Console Mode - A gamescope session launcher with automatic display detection
 #[derive(Parser, Debug)]
@@ -60,6 +86,10 @@ struct Args {
     #[arg(long)]
     launcher: Option<String>,
 
+    /// Launch TUI monitor selector with controller support
+    #[arg(long)]
+    tui_launcher: bool,
+
     /// Additional gamescope arguments
     #[arg(last = true)]
     extra_args: Vec<String>,
@@ -83,10 +113,18 @@ struct DisplayCapabilities {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Check for Sunshine client environment variables as fallback
+    apply_sunshine_env_fallbacks(&mut args);
 
     // Set up environment variables
     setup_environment()?;
+
+    // If TUI launcher mode is requested, run the TUI
+    if args.tui_launcher {
+        return run_tui_launcher(args);
+    }
 
     // Check if we're running nested inside another compositor
     let is_nested = is_running_nested();
@@ -166,6 +204,34 @@ fn setup_environment() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Apply Sunshine client environment variables as fallback for CLI args
+/// These are set by Sunshine when launching applications:
+/// - SUNSHINE_CLIENT_WIDTH: Client's horizontal resolution
+/// - SUNSHINE_CLIENT_HEIGHT: Client's vertical resolution
+/// - SUNSHINE_CLIENT_FPS: Client's framerate setting
+fn apply_sunshine_env_fallbacks(args: &mut Args) {
+    // Only apply fallbacks if the corresponding CLI args weren't provided
+    if args.resolution.is_none() {
+        if let (Ok(width), Ok(height)) = (
+            std::env::var("SUNSHINE_CLIENT_WIDTH"),
+            std::env::var("SUNSHINE_CLIENT_HEIGHT"),
+        ) {
+            let resolution = format!("{}x{}", width, height);
+            eprintln!("Using Sunshine client resolution: {}", resolution);
+            args.resolution = Some(resolution);
+        }
+    }
+
+    if args.refresh_rate.is_none() {
+        if let Ok(fps) = std::env::var("SUNSHINE_CLIENT_FPS") {
+            if let Ok(rate) = fps.parse::<u32>() {
+                eprintln!("Using Sunshine client FPS as refresh rate: {}Hz", rate);
+                args.refresh_rate = Some(rate);
+            }
+        }
+    }
 }
 
 fn detect_displays() -> Result<Vec<DisplayInfo>> {
@@ -662,4 +728,430 @@ fn launch_gamescope_nested(args: &Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// TUI Launcher Implementation
+// ============================================================================
+
+/// Input event from either keyboard or controller
+enum InputEvent {
+    Up,
+    Down,
+    Select,
+    Quit,
+}
+
+/// TUI application state
+struct TuiApp {
+    displays: Vec<DisplayInfo>,
+    list_state: ListState,
+    should_quit: bool,
+    selected_display: Option<DisplayInfo>,
+}
+
+impl TuiApp {
+    fn new(displays: Vec<DisplayInfo>) -> Self {
+        let mut list_state = ListState::default();
+        if !displays.is_empty() {
+            list_state.select(Some(0));
+        }
+        Self {
+            displays,
+            list_state,
+            should_quit: false,
+            selected_display: None,
+        }
+    }
+
+    fn next(&mut self) {
+        if self.displays.is_empty() {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => {
+                if i >= self.displays.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn previous(&mut self) {
+        if self.displays.is_empty() {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.displays.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn select(&mut self) {
+        if let Some(i) = self.list_state.selected() {
+            if i < self.displays.len() {
+                self.selected_display = Some(self.displays[i].clone());
+                self.should_quit = true;
+            }
+        }
+    }
+}
+
+/// Find gamepad devices in /dev/input
+fn find_gamepad_devices() -> Vec<PathBuf> {
+    let mut devices = Vec::new();
+    let input_path = Path::new("/dev/input");
+
+    debug_log("Scanning for gamepad devices in /dev/input...");
+
+    if let Ok(entries) = fs::read_dir(input_path) {
+        let mut entries_vec: Vec<_> = entries.flatten().collect();
+        // Sort entries to process in order
+        entries_vec.sort_by_key(|e| e.path());
+
+        for entry in entries_vec {
+            let path = entry.path();
+            if let Some(name) = path.file_name() {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("event") {
+                    // Check if we can open it and if it's a gamepad
+                    match Device::open(&path) {
+                        Ok(device) => {
+                            let dev_name = device.name().unwrap_or("unknown");
+                            debug_log(&format!("Opened {}: '{}'", path.display(), dev_name));
+
+                            // Check for gamepad-like keys (BTN_SOUTH is common on gamepads)
+                            if let Some(keys) = device.supported_keys() {
+                                let has_south = keys.contains(Key::BTN_SOUTH);
+                                let has_east = keys.contains(Key::BTN_EAST);
+                                debug_log(&format!("  Keys: BTN_SOUTH={}, BTN_EAST={}", has_south, has_east));
+
+                                if has_south || has_east {
+                                    debug_log(&format!("  -> GAMEPAD DETECTED: {}", dev_name));
+                                    devices.push(path);
+                                }
+                            } else {
+                                debug_log("  No supported_keys()");
+                            }
+                        }
+                        Err(e) => {
+                            debug_log(&format!("Cannot open {}: {}", path.display(), e));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        debug_log("Failed to read /dev/input directory");
+    }
+
+    debug_log(&format!("Total gamepads found: {}", devices.len()));
+    devices
+}
+
+/// Spawn a thread to read controller input
+fn spawn_controller_reader(tx: mpsc::Sender<InputEvent>) {
+    thread::spawn(move || {
+        debug_log("Controller reader thread started");
+
+        let device_paths = find_gamepad_devices();
+
+        if device_paths.is_empty() {
+            debug_log("No gamepads found, controller reader exiting");
+            return;
+        }
+
+        // Open the first gamepad found
+        let device_path = &device_paths[0];
+        debug_log(&format!("Opening gamepad at: {}", device_path.display()));
+
+        let mut device = match Device::open(device_path) {
+            Ok(d) => {
+                debug_log(&format!("Successfully opened: {}", d.name().unwrap_or("unknown")));
+                d
+            }
+            Err(e) => {
+                debug_log(&format!("Failed to open device: {}", e));
+                return;
+            }
+        };
+
+        debug_log("Starting event loop...");
+        let mut event_count = 0;
+
+        loop {
+            match device.fetch_events() {
+                Ok(events) => {
+                    for ev in events {
+                        event_count += 1;
+
+                        // Log every event for debugging
+                        if event_count <= 50 {
+                            debug_log(&format!("Event #{}: type={:?}, code={:?}, value={}",
+                                event_count, ev.kind(), ev.code(), ev.value()));
+                        }
+
+                        if let InputEventKind::Key(key) = ev.kind() {
+                            debug_log(&format!("Key event: {:?}, value={}", key, ev.value()));
+
+                            // Only process key press events (value == 1)
+                            if ev.value() == 1 {
+                                let input = match key {
+                                    // D-pad
+                                    Key::BTN_DPAD_UP => {
+                                        debug_log("D-pad UP pressed");
+                                        Some(InputEvent::Up)
+                                    }
+                                    Key::BTN_DPAD_DOWN => {
+                                        debug_log("D-pad DOWN pressed");
+                                        Some(InputEvent::Down)
+                                    }
+                                    // Face buttons (BTN_SOUTH = A/Cross, BTN_WEST = X/Square, BTN_EAST = B/Circle)
+                                    Key::BTN_SOUTH => {
+                                        debug_log("BTN_SOUTH (Cross/A) pressed -> Select");
+                                        Some(InputEvent::Select)
+                                    }
+                                    Key::BTN_WEST => {
+                                        debug_log("BTN_WEST (Square/X) pressed -> Select");
+                                        Some(InputEvent::Select)
+                                    }
+                                    Key::BTN_EAST => {
+                                        debug_log("BTN_EAST (Circle/B) pressed -> Quit");
+                                        Some(InputEvent::Quit)
+                                    }
+                                    _ => None,
+                                };
+
+                                if let Some(input) = input {
+                                    debug_log("Sending input event to TUI...");
+                                    if tx.send(input).is_err() {
+                                        debug_log("Channel closed, exiting controller reader");
+                                        return;
+                                    }
+                                    debug_log("Input event sent successfully");
+                                }
+                            }
+                        }
+
+                        // Handle D-pad as absolute axis (HAT)
+                        if let InputEventKind::AbsAxis(axis) = ev.kind() {
+                            use evdev::AbsoluteAxisType;
+                            match axis {
+                                AbsoluteAxisType::ABS_HAT0Y => {
+                                    debug_log(&format!("ABS_HAT0Y: value={}", ev.value()));
+                                    let input = if ev.value() < 0 {
+                                        debug_log("HAT UP -> Navigation Up");
+                                        Some(InputEvent::Up)
+                                    } else if ev.value() > 0 {
+                                        debug_log("HAT DOWN -> Navigation Down");
+                                        Some(InputEvent::Down)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(input) = input {
+                                        let _ = tx.send(input);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug_log(&format!("Error fetching events: {}", e));
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
+
+/// Render the TUI
+fn render_tui(frame: &mut Frame, app: &mut TuiApp) {
+    let area = frame.area();
+
+    // Create a centered box
+    let popup_area = centered_rect(60, 60, area);
+
+    // Create the list items
+    let items: Vec<ListItem> = app
+        .displays
+        .iter()
+        .map(|d| {
+            let content = format!("{} ({})", d.connector_name, d.resolution);
+            ListItem::new(Line::from(content))
+        })
+        .collect();
+
+    // Create the list widget
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Console Mode - Select Monitor ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, popup_area, &mut app.list_state);
+
+    // Render help text at the bottom
+    let help_area = Rect {
+        x: popup_area.x,
+        y: popup_area.y + popup_area.height,
+        width: popup_area.width,
+        height: 2,
+    };
+
+    if help_area.y + help_area.height <= area.height {
+        let help_text = Paragraph::new(Line::from(vec![
+            Span::styled("[↑/↓] ", Style::default().fg(Color::Yellow)),
+            Span::raw("Navigate  "),
+            Span::styled("[Enter/A] ", Style::default().fg(Color::Green)),
+            Span::raw("Select  "),
+            Span::styled("[Esc/B] ", Style::default().fg(Color::Red)),
+            Span::raw("Quit"),
+        ]));
+        frame.render_widget(help_text, help_area);
+    }
+
+    // Show message if no displays found
+    if app.displays.is_empty() {
+        let msg = Paragraph::new("No connected displays found. Press any key to exit.")
+            .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(msg, popup_area);
+    }
+}
+
+/// Helper to create a centered rectangle
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(r);
+
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_layout[1])[1]
+}
+
+/// Run the TUI launcher
+fn run_tui_launcher(args: Args) -> Result<()> {
+    // Detect displays first
+    let displays = detect_displays()?;
+
+    // If only one display, skip the TUI and just launch
+    if displays.len() == 1 {
+        println!("Single display detected: {} at {}", displays[0].connector_name, displays[0].resolution);
+        thread::sleep(Duration::from_secs(1));
+
+        let mut new_args = args;
+        new_args.display = Some(displays[0].connector_name.clone());
+        new_args.tui_launcher = false;
+
+        // Re-run without TUI
+        return launch_with_display(&displays[0], new_args);
+    }
+
+    // Set up terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app state
+    let mut app = TuiApp::new(displays);
+
+    // Set up input channel for controller
+    let (tx, rx) = mpsc::channel::<InputEvent>();
+    spawn_controller_reader(tx);
+
+    // Main loop
+    loop {
+        // Draw
+        terminal.draw(|f| render_tui(f, &mut app))?;
+
+        // Handle input
+        // Check for controller input (non-blocking)
+        if let Ok(input) = rx.try_recv() {
+            match input {
+                InputEvent::Up => app.previous(),
+                InputEvent::Down => app.next(),
+                InputEvent::Select => app.select(),
+                InputEvent::Quit => app.should_quit = true,
+            }
+        }
+
+        // Check for keyboard input
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                        KeyCode::Down | KeyCode::Char('j') => app.next(),
+                        KeyCode::Enter | KeyCode::Char(' ') => app.select(),
+                        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+
+    // If a display was selected, launch with it
+    if let Some(display) = app.selected_display {
+        println!("\nLaunching with display: {} at {}", display.connector_name, display.resolution);
+        thread::sleep(Duration::from_secs(1));
+
+        let mut new_args = args;
+        new_args.display = Some(display.connector_name.clone());
+        new_args.tui_launcher = false;
+
+        launch_with_display(&display, new_args)?;
+    }
+
+    Ok(())
+}
+
+/// Launch gamescope with a specific display
+fn launch_with_display(display: &DisplayInfo, args: Args) -> Result<()> {
+    // Detect capabilities for this display
+    println!("\n=== Detecting Display Capabilities ===\n");
+    let capabilities = detect_capabilities(display, &args)?;
+    println!();
+    thread::sleep(Duration::from_secs(2));
+
+    // Launch gamescope
+    launch_gamescope(display, &capabilities, &args)
 }
