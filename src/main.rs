@@ -865,27 +865,47 @@ fn spawn_controller_reader(tx: mpsc::Sender<InputEvent>) {
     thread::spawn(move || {
         debug_log("Controller reader thread started");
 
-        let device_paths = find_gamepad_devices();
+        // Retry loop - keep scanning for controllers until one is found
+        // This handles the case where TUI starts before Bluetooth controller connects
+        let mut device: Device;
+        let mut retry_count = 0;
+        const RETRY_INTERVAL_SECS: u64 = 2;
+        const MAX_RETRIES: u32 = 60; // Try for 2 minutes
 
-        if device_paths.is_empty() {
-            debug_log("No gamepads found, controller reader exiting");
-            return;
-        }
+        loop {
+            let device_paths = find_gamepad_devices();
 
-        // Open the first gamepad found
-        let device_path = &device_paths[0];
-        debug_log(&format!("Opening gamepad at: {}", device_path.display()));
+            if !device_paths.is_empty() {
+                // Open the first gamepad found
+                let device_path = &device_paths[0];
+                debug_log(&format!("Opening gamepad at: {}", device_path.display()));
 
-        let mut device = match Device::open(device_path) {
-            Ok(d) => {
-                debug_log(&format!("Successfully opened: {}", d.name().unwrap_or("unknown")));
-                d
+                match Device::open(device_path) {
+                    Ok(d) => {
+                        debug_log(&format!("Successfully opened: {}", d.name().unwrap_or("unknown")));
+                        device = d;
+                        break;
+                    }
+                    Err(e) => {
+                        debug_log(&format!("Failed to open device: {}", e));
+                    }
+                }
             }
-            Err(e) => {
-                debug_log(&format!("Failed to open device: {}", e));
+
+            retry_count += 1;
+            if retry_count >= MAX_RETRIES {
+                debug_log(&format!("No gamepads found after {} retries, giving up", MAX_RETRIES));
                 return;
             }
-        };
+
+            if retry_count == 1 {
+                debug_log("No gamepads found, will retry periodically...");
+            } else if retry_count % 10 == 0 {
+                debug_log(&format!("Still waiting for controller (attempt {}/{})", retry_count, MAX_RETRIES));
+            }
+
+            thread::sleep(Duration::from_secs(RETRY_INTERVAL_SECS));
+        }
 
         debug_log("Starting event loop...");
         let mut event_count = 0;
