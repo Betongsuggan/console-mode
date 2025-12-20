@@ -8,7 +8,7 @@ use crossterm::{
 use evdev::{Device, InputEventKind, Key};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -90,6 +90,10 @@ struct Args {
     #[arg(long)]
     tui_launcher: bool,
 
+    /// Start in idle watcher mode - waits for controller input or Sunshine session
+    #[arg(long)]
+    idle_watcher: bool,
+
     /// Additional gamescope arguments
     #[arg(last = true)]
     extra_args: Vec<String>,
@@ -124,6 +128,11 @@ fn main() -> Result<()> {
     // If TUI launcher mode is requested, run the TUI
     if args.tui_launcher {
         return run_tui_launcher(args);
+    }
+
+    // If idle watcher mode is requested, wait for input or Sunshine session
+    if args.idle_watcher {
+        return run_idle_watcher(args);
     }
 
     // Check if we're running nested inside another compositor
@@ -740,6 +749,7 @@ enum InputEvent {
     Down,
     Select,
     Quit,
+    AnyButton, // Used in idle watcher mode to detect any controller input
 }
 
 /// TUI application state
@@ -1122,6 +1132,7 @@ fn run_tui_launcher(args: Args) -> Result<()> {
                 InputEvent::Down => app.next(),
                 InputEvent::Select => app.select(),
                 InputEvent::Quit => app.should_quit = true,
+                InputEvent::AnyButton => {} // Not used in TUI mode
             }
         }
 
@@ -1174,4 +1185,262 @@ fn launch_with_display(display: &DisplayInfo, args: Args) -> Result<()> {
 
     // Launch gamescope
     launch_gamescope(display, &capabilities, &args)
+}
+
+// ============================================================================
+// Idle Watcher Implementation
+// ============================================================================
+
+/// Check if gamescope is currently running (started by Sunshine)
+fn is_gamescope_running() -> bool {
+    std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("gamescope")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn a controller reader for idle watcher mode (sends AnyButton for any input)
+fn spawn_idle_controller_reader(tx: mpsc::Sender<InputEvent>) {
+    thread::spawn(move || {
+        debug_log("Idle controller reader thread started");
+
+        // Retry loop - keep scanning for controllers
+        let mut device: Device;
+        let mut retry_count = 0;
+        const RETRY_INTERVAL_SECS: u64 = 2;
+        const MAX_RETRIES: u32 = 180; // Try for 6 minutes in idle mode
+
+        loop {
+            let device_paths = find_gamepad_devices();
+
+            if !device_paths.is_empty() {
+                let device_path = &device_paths[0];
+                debug_log(&format!("Opening gamepad at: {}", device_path.display()));
+
+                match Device::open(device_path) {
+                    Ok(d) => {
+                        debug_log(&format!("Successfully opened: {}", d.name().unwrap_or("unknown")));
+                        device = d;
+                        // Send a message to indicate controller is connected
+                        break;
+                    }
+                    Err(e) => {
+                        debug_log(&format!("Failed to open device: {}", e));
+                    }
+                }
+            }
+
+            retry_count += 1;
+            if retry_count >= MAX_RETRIES {
+                debug_log(&format!("No gamepads found after {} retries, giving up", MAX_RETRIES));
+                return;
+            }
+
+            if retry_count == 1 {
+                debug_log("No gamepads found, will retry periodically...");
+            } else if retry_count % 15 == 0 {
+                debug_log(&format!("Still waiting for controller (attempt {}/{})", retry_count, MAX_RETRIES));
+            }
+
+            thread::sleep(Duration::from_secs(RETRY_INTERVAL_SECS));
+        }
+
+        debug_log("Idle watcher: Starting event loop for any button...");
+
+        loop {
+            match device.fetch_events() {
+                Ok(events) => {
+                    for ev in events {
+                        // In idle mode, any key press triggers the TUI
+                        if let InputEventKind::Key(_) = ev.kind() {
+                            if ev.value() == 1 {
+                                debug_log("Idle watcher: Button pressed, triggering TUI");
+                                let _ = tx.send(InputEvent::AnyButton);
+                                return; // Exit after sending
+                            }
+                        }
+                        // Also trigger on D-pad (HAT) movement
+                        if let InputEventKind::AbsAxis(axis) = ev.kind() {
+                            use evdev::AbsoluteAxisType;
+                            if matches!(axis, AbsoluteAxisType::ABS_HAT0X | AbsoluteAxisType::ABS_HAT0Y) {
+                                if ev.value() != 0 {
+                                    debug_log("Idle watcher: D-pad pressed, triggering TUI");
+                                    let _ = tx.send(InputEvent::AnyButton);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug_log(&format!("Error fetching events: {}", e));
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
+
+/// Render the idle watcher UI
+fn render_idle_watcher(frame: &mut Frame, controller_connected: bool) {
+    let area = frame.area();
+
+    // Create a centered box
+    let popup_area = centered_rect(70, 40, area);
+
+    // Build the content
+    let controller_status = if controller_connected {
+        Line::from(vec![
+            Span::styled("Controller: ", Style::default().fg(Color::White)),
+            Span::styled("Connected", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Controller: ", Style::default().fg(Color::White)),
+            Span::styled("Waiting...", Style::default().fg(Color::Yellow)),
+        ])
+    };
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Console Mode",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Press any controller button to start local gaming"),
+        Line::from(""),
+        controller_status,
+        Line::from(""),
+        Line::from(Span::styled(
+            "Waiting for Sunshine connection...",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Idle ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
+
+    // Render help text at the bottom
+    let help_area = Rect {
+        x: popup_area.x,
+        y: popup_area.y + popup_area.height,
+        width: popup_area.width,
+        height: 1,
+    };
+
+    if help_area.y + help_area.height <= area.height {
+        let help_text = Paragraph::new(Line::from(vec![
+            Span::styled("[ESC] ", Style::default().fg(Color::Red)),
+            Span::raw("Quit to shell"),
+        ]));
+        frame.render_widget(help_text, help_area);
+    }
+}
+
+/// Run the idle watcher - waits for controller input or Sunshine session
+fn run_idle_watcher(args: Args) -> Result<()> {
+    debug_log("Starting idle watcher mode");
+
+    // Check if gamescope is already running (Sunshine may have started it)
+    if is_gamescope_running() {
+        debug_log("Gamescope already running, exiting idle watcher");
+        println!("Gamescope already running (started by Sunshine), exiting.");
+        return Ok(());
+    }
+
+    // Set up terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Set up input channel for controller
+    let (tx, rx) = mpsc::channel::<InputEvent>();
+    spawn_idle_controller_reader(tx);
+
+    let mut controller_connected = false;
+    let mut should_start_tui = false;
+    let mut should_quit = false;
+
+    // Main loop
+    loop {
+        // Check if gamescope started (Sunshine launched it)
+        if is_gamescope_running() {
+            debug_log("Idle watcher: Gamescope detected, exiting");
+            break;
+        }
+
+        // Draw
+        terminal.draw(|f| render_idle_watcher(f, controller_connected))?;
+
+        // Check for controller input (non-blocking)
+        match rx.try_recv() {
+            Ok(InputEvent::AnyButton) => {
+                debug_log("Idle watcher: Received AnyButton, starting TUI");
+                should_start_tui = true;
+                break;
+            }
+            Ok(_) => {
+                // Controller is connected if we receive any message
+                controller_connected = true;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Channel closed, controller thread exited without finding controller
+            }
+        }
+
+        // Check for keyboard input
+        if event::poll(Duration::from_millis(500))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            debug_log("Idle watcher: Keyboard triggered TUI");
+                            should_start_tui = true;
+                            break;
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            debug_log("Idle watcher: Keyboard quit");
+                            should_quit = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+
+    if should_start_tui {
+        println!("\nStarting monitor selection...\n");
+        thread::sleep(Duration::from_millis(500));
+        return run_tui_launcher(args);
+    }
+
+    if should_quit {
+        println!("Exiting to shell.");
+    } else {
+        println!("Sunshine session detected, exiting idle watcher.");
+    }
+
+    Ok(())
 }
